@@ -397,6 +397,11 @@ export function CapabilitiesTab({ agent }: { agent: Agent }) {
           open={!collapsed.schedules}
           onToggle={(open) => setFold('schedules', open)}
         >
+          {!email.enabled && !grant && (
+            <div role="status" style={{ ...hint, marginBottom: 8 }}>
+               {name} cannot check email
+            </div>
+          )}
           <AgentSchedules agentId={agent.id} agentName={name} />
         </TriggerCard>
 

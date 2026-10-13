@@ -15,6 +15,7 @@ import { WhenLines, fieldsFromLines, linesFromMission, sameLines, type LineDraft
 import { cleanFocus, FOCUS_MAX, GOD_ALIAS, missionsFor, nextRunAt, ownerOf, OWNER, type ScheduledMission } from '@shared/missions';
 import { effectiveWorkStyle } from '@shared/michaelWorkStyle';
 import { useRtl } from '@/i18n/useDirection';
+import { useHarnessConfig } from '@/hooks/useHarnessConfig';
 
 /**
  * SCHEDULES, per agent (docs/designs/per-agent-schedules.md).
@@ -580,6 +581,7 @@ export function AgentSchedules({ agentId, agentName }: { agentId: string; agentN
 /** Every other agent's schedules, read only, grouped by agent. */
 export function OfficeSchedules() {
   const { t } = useTranslation();
+  const config = useHarnessConfig();
   const { missions, status, retry } = useMissions();
   const godId = useGodId();
   const nameOf = useNameOf();
@@ -617,6 +619,11 @@ export function OfficeSchedules() {
             <div style={{ fontSize: 14, lineHeight: '20px', fontWeight: 600, color: 'var(--cth-ink-900)' }}>
               {isClosed ? t('schedulesSection.closedGroup', { name }) : name}
             </div>
+            {!config?.agentCapabilities?.[owner]?.email?.enabled && !config?.agentCapabilities?.[owner]?.sendOnly && (
+              <div role="status" style={{ fontSize: 12, color: 'var(--cth-ink-600)', marginTop: 4 }}>
+                {name} cannot check email
+              </div>
+            )}
             {isClosed && <Hint>{t('schedulesSection.closedNote', { name })}</Hint>}
             <div style={{ boxShadow: 'inset 0 1px 0 var(--cth-ink-100)' }}>
               {rows.map((m) => (

@@ -17,6 +17,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { Readable } from 'node:stream';
 import { resolveMx } from 'node:dns/promises';
 import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
@@ -56,13 +57,7 @@ const SEND_TIMEOUT_MS = 60_000;
 const MX_LOOKUP_TIMEOUT_MS = 5_000;
 const SEARCH_DEFAULT = 20;
 const SEARCH_MAX = 50;
-/** How long a search's ids are kept for its next pages, and how many searches. */
-const SEARCH_KEEP_MS = 60_000;
-const SEARCHES_KEPT = 20;
 const BODY_MAX_CHARS = 50_000;
-/** A message bigger than this is read part by part, and this is the most of
- *  its text a read downloads. Well past BODY_MAX_CHARS of any text. */
-const TEXT_PART_MAX_BYTES = 1_000_000;
 const IDLE_CLOSE_MS = 5 * 60_000;
 const SEND_MEMORY_MS = 10 * 60_000;
 /** How long a send the app stopped in the middle of stays refused. Longer than
@@ -107,64 +102,13 @@ export interface ImapLike {
   getMailboxLock(path: string): Promise<{ release(): void }>;
   search(query: Record<string, unknown>, opts?: { uid?: boolean }): Promise<number[] | false>;
   fetchOne(uid: string | number, query: Record<string, unknown>, opts?: { uid?: boolean }): Promise<any>;
+  download(range: string | number, part: string, options?: { uid?: boolean; maxBytes?: number }): Promise<{ meta: Record<string, unknown>; content: NodeJS.ReadableStream }>;
   fetch(range: string | number[], query: Record<string, unknown>, opts?: { uid?: boolean }): AsyncIterable<any>;
   append(path: string, content: Buffer | string, flags?: string[]): Promise<unknown>;
   messageFlagsAdd?(range: string | number[], flags: string[], opts?: { uid?: boolean; useLabels?: boolean }): Promise<unknown>;
   messageMove?(range: string | number[], destination: string, opts?: { uid?: boolean }): Promise<unknown>;
   mailboxCreate?(path: string): Promise<unknown>;
-  /** One body part, decoded, as UTF-8 for text (ImapFlow). Optional so a
-   *  client without it reads whole messages. */
-  download?(range: string | number, part?: string, options?: { uid?: boolean; maxBytes?: number }): Promise<{ content?: AsyncIterable<Buffer | string> }>;
   on?(event: string, fn: (...a: any[]) => void): unknown;
-}
-
-/** A node of a message's BODYSTRUCTURE, as ImapFlow parses it. */
-interface BodyNode {
-  part?: string;
-  type?: string;
-  parameters?: Record<string, string>;
-  encoding?: string;
-  size?: number;
-  disposition?: string;
-  dispositionParameters?: Record<string, string>;
-  childNodes?: BodyNode[];
-}
-
-/** Body text as mailparser sees it: an inline plain or HTML part. Anything
- *  else is an attachment. */
-const isBodyText = (n: BodyNode): boolean =>
-  (n.type === 'text/plain' || n.type === 'text/html') && (!n.disposition || n.disposition === 'inline');
-
-/** The parts a read shows, in order, like a whole-message parse: every body
- *  text part, and from an alternative only its plain one (else its last). */
-function bodyPartsOf(root: BodyNode): BodyNode[] {
-  const out: BodyNode[] = [];
-  const walk = (n: BodyNode): void => {
-    if (n.type === 'message/rfc822') return;
-    if (!n.childNodes?.length) { if (isBodyText(n)) out.push(n); return; }
-    if (n.type === 'multipart/alternative') {
-      const plain = n.childNodes.find((child) => child.type === 'text/plain' && isBodyText(child));
-      if (plain) out.push(plain); else walk(n.childNodes[n.childNodes.length - 1]);
-      return;
-    }
-    n.childNodes.forEach(walk);
-  };
-  walk(root);
-  return out;
-}
-
-/** Attachment names and sizes from the structure, without downloading any.
- *  Base64 is counted back to bytes (wrapped at 76 characters plus CRLF). */
-function attachmentsOf(root: BodyNode): Array<{ name: string; size: number }> {
-  const out: Array<{ name: string; size: number }> = [];
-  const walk = (n: BodyNode): void => {
-    if (n.childNodes?.length && n.type !== 'message/rfc822') { n.childNodes.forEach(walk); return; }
-    if (isBodyText(n)) return;
-    const size = n.size ?? 0;
-    out.push({ name: n.dispositionParameters?.filename || n.parameters?.name || 'attachment', size: n.encoding === 'base64' ? Math.floor((size - 2 * Math.floor(size / 78)) * 3 / 4) : size });
-  };
-  walk(root);
-  return out;
 }
 
 /**
@@ -192,6 +136,53 @@ const folderName = (key: FolderKey): string => (typeof key === 'string' ? key : 
 export function messageIdFor(key: FolderKey, uid: number | string): string {
   if (key === 'inbox') return String(uid);
   return typeof key === 'string' ? `${key}:${uid}` : `label:${key.label}:${uid}`;
+}
+
+type MailBodyPart = {
+  part?: string;
+  type?: string;
+  disposition?: string;
+  dispositionParameters?: Record<string, string>;
+  parameters?: Record<string, string>;
+  size?: number;
+  childNodes?: MailBodyPart[];
+};
+
+function findMailTextParts(structure: MailBodyPart | undefined) {
+  const textParts: Array<{ part: string; type: 'text/plain' | 'text/html'; size?: number  }> = [];
+  const attachments: Array<{ name: string; size: number }> = [];
+
+  function walk(node: MailBodyPart) {
+    const filename =
+      node.dispositionParameters?.filename ??
+      node.parameters?.name;
+
+    if (node.disposition === 'attachment' || filename) {
+      attachments.push({
+        name: filename ?? 'attachment',
+        size: node.size ?? 0
+      });
+      return;
+    }
+
+    if (node.childNodes?.length) {
+      for (const child of node.childNodes) walk(child);
+      return;
+    }
+
+    if (node.type === 'text/plain' || node.type === 'text/html') {
+      textParts.push({ part: node.part || '1', type: node.type, size: node.size });
+    }
+  }
+
+  if (structure) walk(structure);
+
+  return {
+    textParts: textParts.sort((a, b) =>
+      a.type === b.type ? 0 : a.type === 'text/plain' ? -1 : 1
+    ),
+    attachments
+  };
 }
 
 /** The folder and IMAP uid an id names. Anything else is refused, never guessed. */
@@ -285,9 +276,7 @@ export function classifyMailError(e: unknown): MailError {
   if (/application-specific password required|web login required|basic auth(entication)? (is )?(disabled|blocked)|app passwords? (are |is )?(not allowed|disabled)|please log ?in via your web browser/i.test(text)) {
     return new MailError('provider-blocked', 'This provider no longer accepts the app password for this mailbox.');
   }
-  // 535 is the SMTP reply code for a refused login. It counts only as a reply
-  // code, never inside an address or a number a rejection quotes (ann1535@...).
-  if (err?.authenticationFailed || err?.code === 'EAUTH' || /AUTHENTICATIONFAILED|invalid credentials|authentication failed|(?:^|\s)535[\s-]/i.test(text)) {
+  if (err?.authenticationFailed || err?.code === 'EAUTH' || /AUTHENTICATIONFAILED|invalid credentials|authentication failed|535/i.test(text)) {
     return new MailError('auth', "The mailbox didn't accept that password. Check it's an app password, not your normal one.");
   }
   if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ESOCKET', 'ECONNECTION', 'EPIPE', 'NoConnection'].includes(err?.code ?? '')) {
@@ -347,9 +336,6 @@ export class MailService {
   /** Sends in progress by the same key, so an identical send that overlaps
    *  waits for the first and gets its result instead of sending again. */
   private readonly inFlight = new Map<string, Promise<{ sent: boolean; messageId: string }>>();
-  /** Recent searches' ids, newest first, so a later page doesn't search the
-   *  whole folder again. Page one always searches. */
-  private readonly searches = new Map<string, { mailbox: string; at: number; uids: number[] }>();
   private readonly createImap: NonNullable<MailDeps['createImap']>;
   private readonly createSmtp: NonNullable<MailDeps['createSmtp']>;
   private readonly resolveMx: NonNullable<MailDeps['resolveMx']>;
@@ -437,13 +423,8 @@ export class MailService {
     if (open) this.drop(id);
     const rec = this.record(id);
     const client = this.createImap(rec.imap, rec.address, this.password(id));
-    // A replaced socket can finish closing after its successor connects.
-    // Only the client still held for this mailbox may drop that connection.
-    const disconnected = (): void => {
-      if (this.boxes.get(id)?.client === client) this.drop(id);
-    };
-    client.on?.('error', disconnected);
-    client.on?.('close', disconnected);
+    client.on?.('error', () => this.drop(id));
+    client.on?.('close', () => this.drop(id));
     try {
       await withTimeout(client.connect(), CALL_TIMEOUT_MS, 'Connecting to the mailbox');
     } catch (e) {
@@ -558,19 +539,17 @@ export class MailService {
       if (!Object.keys(query).length) query.all = true;
       // Never the owner's unsent drafts: Gmail's All Mail (the archive) holds them too.
       query.draft = false;
-      const newest = await this.searchIds(c, id, key, query, page);
+      const uids = (await c.search(query, { uid: true })) || [];
+      const newest = [...uids].sort((a, b) => b - a);
       const slice = newest.slice(page * limit, page * limit + limit);
       const messages: Array<{ id: string; from: string; subject: string; date: string; unread: boolean }> = [];
       if (slice.length) {
         for await (const m of c.fetch(slice, { uid: true, envelope: true, flags: true }, { uid: true })) {
-          // imapflow hands back the raw header text when it cannot read a date,
-          // and toISOString throws on that, failing the whole search over one email.
-          const sent = m.envelope?.date ? new Date(m.envelope.date) : null;
           messages.push({
             id: messageIdFor(key, m.uid),
             from: addrText(m.envelope?.from),
             subject: m.envelope?.subject ?? '',
-            date: sent && !Number.isNaN(sent.getTime()) ? sent.toISOString() : '',
+            date: m.envelope?.date ? new Date(m.envelope.date).toISOString() : '',
             unread: !(m.flags instanceof Set ? m.flags.has('\\Seen') : false)
           });
         }
@@ -587,21 +566,6 @@ export class MailService {
     }, 'Searching the mailbox');
   }
 
-  /** The ids a query matches, newest first. A later page reuses what its
-   *  first page found, for up to SEARCH_KEEP_MS. */
-  private async searchIds(c: ImapLike, id: string, key: FolderKey, query: Record<string, unknown>, page: number): Promise<number[]> {
-    const now = Date.now();
-    for (const [k, v] of this.searches) if (now - v.at > SEARCH_KEEP_MS) this.searches.delete(k);
-    const cacheKey = JSON.stringify([id, key, query]);
-    const kept = this.searches.get(cacheKey);
-    if (page > 0 && kept) return kept.uids;
-    const uids = [...((await c.search(query, { uid: true })) || [])].sort((a, b) => b - a);
-    this.searches.delete(cacheKey);
-    this.searches.set(cacheKey, { mailbox: id, at: now, uids });
-    if (this.searches.size > SEARCHES_KEPT) this.searches.delete(this.searches.keys().next().value!);
-    return uids;
-  }
-
   /**
    * Inbox zero (owner, 2026-10-03): take messages out of the inbox without
    * deleting any. `archive` marks them read and moves them to the archive, or,
@@ -612,8 +576,6 @@ export class MailService {
    */
   async organize(id: string, action: 'archive' | 'mark_read' | 'mark_junk', uids: number[], label?: string) {
     if (!uids.length) throw new MailError('bad-request', `${action} needs the message ids from search.`);
-    // Moved or marked mail changes what a search finds: search again.
-    for (const [k, v] of this.searches) if (v.mailbox === id) this.searches.delete(k);
     return this.inFolder(id, MailService.inbox, async (c) => {
       if (!c.messageFlagsAdd || !c.messageMove) throw new MailError('unsupported', 'This mailbox cannot move messages.');
       // Only the asked-for ids are searched, not the whole inbox.
@@ -682,13 +644,7 @@ export class MailService {
       if (head && typeof head.size === 'number' && head.size > maxBytes) throw new MailError('bad-request', REFERENCE_TOO_LARGE);
     }
     const m = await c.fetchOne(uid, { uid: true, source: true, flags: true }, { uid: true });
-    MailService.checkReadable(m && m.source ? m : false, uid, key);
-    return Buffer.isBuffer(m.source) ? m.source : Buffer.from(m.source);
-  }
-
-  /** Throws unless the fetched message is there and isn't a draft. */
-  private static checkReadable(m: { flags?: unknown } | false | null | undefined, uid: string, key: FolderKey): void {
-    if (!m) {
+    if (!m || !m.source) {
       // A plain number is an inbox id, and mail leaves the inbox when it is
       // archived. Say where to look, so an agent searches the archive instead of
       // deciding archived mail is out of reach (owner, 2026-10-04: Pam read an
@@ -700,79 +656,58 @@ export class MailService {
     // A draft is the owner's own unsent words, whichever folder holds it.
     const flags: Set<string> = m.flags instanceof Set ? m.flags : new Set(Array.isArray(m.flags) ? m.flags : []);
     if (flags.has('\\Draft')) throw new MailError('bad-request', 'That message is an unsent draft, which the team does not read.');
+    return Buffer.isBuffer(m.source) ? m.source : Buffer.from(m.source);
   }
 
   async read(id: string, messageId: string) {
     const { key, uid } = parseMessageId(messageId);
     return this.inFolder(id, MailService.folderOf(key), async (c) => {
-      if (!c.download) return this.readWhole(c, uid, key, messageId);
-      // The structure first. A small message is read whole, as before; a big
-      // one downloads only its body text, never the attachments.
-      const m = await c.fetchOne(uid, { uid: true, flags: true, size: true, envelope: true, bodyStructure: true }, { uid: true });
-      MailService.checkReadable(m, uid, key);
-      if (!m.bodyStructure || !m.envelope || !(m.size > TEXT_PART_MAX_BYTES)) return this.readWhole(c, uid, key, messageId);
-      let body: { text: string; cut: boolean };
-      try {
-        body = await this.bodyText(c, uid, bodyPartsOf(m.bodyStructure));
-      } catch (err) {
-        // A server that won't send a part can still send the whole message.
-        if (['network', 'timeout', 'auth'].includes(classifyMailError(err).kind)) throw err;
-        return this.readWhole(c, uid, key, messageId);
+      const info = await c.fetchOne(uid, { uid: true, envelope: true, bodyStructure: true, flags: true }, { uid: true });
+      if(!info){
+        throw new MailError('not-found', `No message with id ${uid} in that folder.`);
       }
-      let { text } = body;
-      const truncated = text.length > BODY_MAX_CHARS || body.cut;
-      if (text.length > BODY_MAX_CHARS) text = `${text.slice(0, BODY_MAX_CHARS)}\n\n[message cut at ${BODY_MAX_CHARS} characters]`;
-      else if (body.cut) text = `${text}\n\n[message cut]`;
-      const e = m.envelope;
-      const date = e.date ? new Date(e.date) : null;
+      const flags: Set<string> = info.flags instanceof Set
+       ? info.flags
+       : new Set(Array.isArray(info.flags) ? info.flags : []);
+
+      if (flags.has('\\Draft')) {
+       throw new MailError('bad-request', 'That message is an unsent draft, which the team does not read.');
+      }
+      const structure = info.bodyStructure;
+      const { textParts, attachments } = findMailTextParts(structure);
+      const selectedPart = textParts[0];
+
+      const downloaded = selectedPart
+       ? await c.download(uid, selectedPart.part, { uid: true, maxBytes: 256_000 })
+       : null;
+      const chunks: Buffer[] = [];
+
+       if (downloaded?.content) {
+         for await (const chunk of downloaded.content) {
+         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        }
+
+      const downloadedText = Buffer.concat(chunks).toString('utf8');
+      
+      const contentType = selectedPart?.type ?? 'text/plain';
+
+      const parsed = await simpleParser(`Content-Type: ${contentType}; charset=utf-8\r\n\r\n${downloadedText}`);
+      let text = parsed.text ?? (typeof parsed.html === 'string' ? parsed.html.replace(/<[^>]+>/g, ' ') : '') ?? '';
+      const truncated = text.length > BODY_MAX_CHARS || (selectedPart?.size !== undefined && selectedPart.size > 256_000);
+      if (truncated) text = `${text.slice(0, BODY_MAX_CHARS)}\n\n[message cut at ${BODY_MAX_CHARS} characters]`;
       return {
         id: messageId,
-        from: addrText(e.from), to: addrText(e.to), cc: addrText(e.cc),
-        subject: e.subject ?? '', date: date && !Number.isNaN(date.getTime()) ? date.toISOString() : '',
-        messageId: e.messageId ?? '',
+        from: (info.envelope?.from ?? []).map((a: { name?: string; address?: string }) => a.address ?? a.name ?? '').join(', '),
+        to: (info.envelope?.to ?? []).map((a: { name?: string; address?: string }) => a.address ?? a.name ?? '').join(', '),
+        cc: (info.envelope?.cc ?? []).map((a: { name?: string; address?: string }) => a.address ?? a.name ?? '').join(', '),
+        subject: info.envelope?.subject ?? '',
+        date: info.envelope?.date ? new Date(info.envelope.date).toISOString() : '',
+        messageId: info.envelope?.messageId ?? '',
         text, truncated,
-        attachments: attachmentsOf(m.bodyStructure)
+        attachments
       };
     }, 'Reading the message');
-  }
-
-  /** The body parts decoded to UTF-8 and joined the way mailparser joins them,
-   *  downloading TEXT_PART_MAX_BYTES at most. It stops once there's more text
-   *  than a read shows. */
-  private async bodyText(c: ImapLike, uid: string, parts: BodyNode[]): Promise<{ text: string; cut: boolean }> {
-    const texts: string[] = [];
-    let used = 0;
-    let cut = false;
-    for (const node of parts) {
-      const max = TEXT_PART_MAX_BYTES - used;
-      if (max <= 0 || texts.join('\n').length > BODY_MAX_CHARS) break;
-      const { content } = await c.download!(uid, node.part || '1', { uid: true, maxBytes: max });
-      const chunks: Buffer[] = [];
-      if (content) for await (const chunk of content) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      const raw = Buffer.concat(chunks);
-      if (raw.length >= max) cut = true;
-      used += raw.length;
-      texts.push(node.type === 'text/html'
-        ? (await simpleParser(Buffer.concat([Buffer.from('Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n'), raw]))).text ?? ''
-        : raw.toString('utf8').replace(/\r\n?/g, '\n'));
-    }
-    return { text: texts.join('\n'), cut };
-  }
-
-  /** A read of the whole message: a small one, or a client that can't fetch parts. */
-  private async readWhole(c: ImapLike, uid: string, key: FolderKey, messageId: string) {
-    const parsed = await simpleParser(await this.source(c, uid, key));
-    let text = parsed.text ?? (typeof parsed.html === 'string' ? parsed.html.replace(/<[^>]+>/g, ' ') : '') ?? '';
-    const truncated = text.length > BODY_MAX_CHARS;
-    if (truncated) text = `${text.slice(0, BODY_MAX_CHARS)}\n\n[message cut at ${BODY_MAX_CHARS} characters]`;
-    return {
-      id: messageId,
-      from: addrText(parsed.from), to: addrText(parsed.to), cc: addrText(parsed.cc),
-      subject: parsed.subject ?? '', date: parsed.date ? parsed.date.toISOString() : '',
-      messageId: parsed.messageId ?? '',
-      text, truncated,
-      attachments: (parsed.attachments ?? []).map((a) => ({ name: a.filename ?? 'attachment', size: a.size }))
-    };
   }
 
   /** Build the MIME for a draft or send. References are fetched here, from the
@@ -1094,22 +1029,7 @@ async function runMailRequest(
     refs: { forward: !!ref(body.forward), attachFrom: !!attachRefs?.length },
     present: deps.present
   });
-  if (!access.ok) {
-    try {
-      deps.audit?.({
-        kind: 'mail-access-denied',
-        agentId,
-        mailbox: mailbox ?? null,
-        operation: op,
-        outcome: 'denied',
-        timestamp: new Date().toISOString()
-      });
-    } catch {
-      // Audit logging must not expose details or alter the refusal.
-    }
-
-    return { status: 403, body: { error: access.reason } };
-  }
+  if (!access.ok) return { status: 403, body: { error: access.reason } };
   // A Send only grant on the named mailbox (shared-mailboxes.md).
   const grant = sendOnlyGrant(cfg, agentId);
   const underGrant = !!grant && !!mailbox && grant.mailbox === mailbox;

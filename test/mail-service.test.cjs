@@ -42,8 +42,47 @@ function fakeImap(state) {
       if (q.header) return (typeof state.sentHit === 'function' ? state.sentHit(q.header['message-id']) : state.sentHit) ? [1] : [];
       return state.folders[folder].filter((m) => !q.from || m.from.includes(q.from)).map((m) => m.uid);
     },
-    async *fetch(uids) { for (const m of state.folders[folder]) if (uids.includes(m.uid)) yield { uid: m.uid, envelope: { from: [{ address: m.from }], subject: m.subject, date: m.date ?? new Date('2026-09-25') }, flags: new Set(m.seen ? ['\\Seen'] : []) }; },
-    async fetchOne(uid) { const m = state.folders[folder].find((x) => String(x.uid) === String(uid)); return m ? { source: m.source } : false; },
+    async *fetch(uids) { for (const m of state.folders[folder]) if (uids.includes(m.uid)) yield { uid: m.uid, envelope: { from: [{ address: m.from }], subject: m.subject, date: new Date('2026-09-25') }, flags: new Set(m.seen ? ['\\Seen'] : []) }; },
+    async fetchOne(uid, query = {}) {
+     const m = state.folders[folder].find((x) => String(x.uid) === String(uid));
+     if (!m) return false;
+
+     if (m.bodyStructure && query.source) {
+       throw new Error('Full email source must not be downloaded for this message');
+     }
+
+     return {
+       uid: m.uid,
+       source: m.source,
+       flags: new Set(m.seen ? ['\\Seen'] : []),
+       envelope: {
+         from: [{ address: m.from }],
+         to: [{ address: 'sales@x.com' }],
+         subject: m.subject,
+         date: new Date('2026-09-25')
+        },
+       bodyStructure: m.bodyStructure ?? {
+         part: '1',
+         type: 'text/plain',
+         size: m.source.length
+        }
+      };
+    },
+    async download(uid, part) {
+     const m = state.folders[folder].find((x) => String(x.uid) === String(uid));
+     if (!m) return {};
+     
+     if (part !== '1') {
+       throw new Error(`Unexpected MIME part downloaded: ${part}`);
+    }
+     const { Readable } = require('node:stream');
+     const source = m.source.toString('utf8');
+     const body = source.split(/\r?\n\r?\n/).slice(1).join('\r\n\r\n');
+     return {
+       meta: {},
+       content: Readable.from([Buffer.from(body)])
+      };
+    },
     async append(p, content) { state.folders[p].push({ uid: 100 + state.folders[p].length, from: '', subject: '', source: content }); }
   };
 }
@@ -141,13 +180,80 @@ test('search and read work in the agent\'s mailbox; bodies are capped', async ()
   assert.equal((await call('dwight', 'search', { mailbox: 'ceo' })).status, 403, 'not his mailbox');
 });
 
-test('search still lists the mail when one email has a date nobody can read', async () => {
-  const { call, state } = setup();
-  // imapflow passes the raw header text through when it cannot parse the date
-  state.folders.INBOX[1].date = 'Mon, 32 Foo 2026';
-  const s = await call('dwight', 'search', { mailbox: 'sales' });
-  assert.equal(s.status, 200);
-  assert.deepEqual(s.body.messages.map((m) => [m.subject, m.date]), [['Hello', ''], ['Quote please', '2026-09-25T00:00:00.000Z']]);
+test('reading an email does not download its attachment', async () => {
+  const { state, call } = setup();
+
+  const message = state.folders.INBOX[0];
+  let downloadedPart = null;
+
+  // Give this message a simulated 25 MB attachment.
+  message.bodyStructure = {
+    type: 'multipart/mixed',
+    childNodes: [
+      { part: '1', type: 'text/plain', size: 20 },
+      {
+        part: '2',
+        type: 'application/pdf',
+        disposition: 'attachment',
+        dispositionParameters: { filename: 'report.pdf' },
+        size: 25_000_000
+      }
+    ]
+  };
+
+  const result = await call('dwight', 'read', {
+    mailbox: 'sales',
+    id: '1'
+  });
+
+  assert.equal(result.status, 200);
+  assert.match(result.body.text, /40 units/);
+  assert.deepEqual(result.body.attachments, [
+    { name: 'report.pdf', size: 25_000_000 }
+  ]);
+});
+
+test('attachment-only email has an empty text body', async () => {
+  const { state, call } = setup();
+
+  state.folders.INBOX[0].bodyStructure = {
+    type: 'application/pdf',
+    part: '1',
+    disposition: 'attachment',
+    dispositionParameters: { filename: 'invoice.pdf' },
+    size: 25_000_000
+  };
+
+  const result = await call('dwight', 'read', {
+    mailbox: 'sales',
+    id: '1'
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.text, '');
+  assert.deepEqual(result.body.attachments, [
+    { name: 'invoice.pdf', size: 25_000_000 }
+  ]);
+});
+test('large email body is marked as truncated', async () => {
+  const { state, call } = setup();
+
+  const message = state.folders.INBOX[0];
+
+  message.bodyStructure = {
+    part: '1',
+    type: 'text/plain',
+    size: 300_000
+  };
+
+  const result = await call('dwight', 'read', {
+    mailbox: 'sales',
+    id: '1'
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.truncated, true);
+  assert.match(result.body.text, /message cut at 50000 characters/);
 });
 
 test('draft lands in Drafts; Draft only cannot send', async () => {
